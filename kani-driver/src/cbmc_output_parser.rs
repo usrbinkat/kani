@@ -517,9 +517,19 @@ impl Parser {
     }
 }
 
+/// How the CBMC process ended, as the operating system reports it: its exit code, or the signal
+/// that terminated it. The two are kept apart: an exit code of 137 is not a SIGKILL, and neither
+/// is evidence of what sent the signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProcessTermination {
+    Exited { code: i32 },
+    Signaled { signal: i32 },
+}
+
 /// The verification output, as extracted by the CBMC output parser.
 pub struct VerificationOutput {
-    pub process_status: i32,
+    pub termination: ProcessTermination,
     pub processed_items: Vec<ParserItem>,
 }
 
@@ -530,7 +540,7 @@ pub struct VerificationOutput {
 /// In general, a filter will pre-process an item (this may or may not transform the item),
 /// then formatted (according to the output format) and print.
 ///
-/// The cbmc process status is returned, along with the (post-filter) items.
+/// The cbmc process's termination is returned, along with the (post-filter) items.
 pub async fn process_cbmc_output(
     process: &mut Child,
     mut eager_filter: impl FnMut(ParserItem) -> Option<ParserItem>,
@@ -550,19 +560,17 @@ pub async fn process_cbmc_output(
     // This will get us the process's exit code
     let status = process.wait().await?;
 
-    let process_status = match (status.code(), status.signal()) {
+    let termination = match (status.code(), status.signal()) {
         // normal unix exit codes (cbmc uses currently 0-10)
         // https://github.com/diffblue/cbmc/blob/develop/src/util/exit_codes.h
-        (Some(x), _) => x,
-        // process exited with signal (e.g. OOM-killed)
-        // bash/zsh have a convention for translating signal number to exit code:
-        // https://tldp.org/LDP/abs/html/exitcodes.html
-        (_, Some(x)) => 128 + x,
-        // I think this shouldn't happen? either exit or signal, right?
-        (None, None) => unreachable!("Process exited with neither status code nor signal?"),
+        (Some(code), _) => ProcessTermination::Exited { code },
+        (None, Some(signal)) => ProcessTermination::Signaled { signal },
+        (None, None) => {
+            anyhow::bail!("CBMC ended with neither an exit code nor a signal: {status}")
+        }
     };
 
-    Ok(VerificationOutput { process_status, processed_items })
+    Ok(VerificationOutput { termination, processed_items })
 }
 
 /// Takes (by ownership) a vector of messages, and returns that vector with the `Result`

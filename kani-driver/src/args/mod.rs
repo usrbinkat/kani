@@ -867,6 +867,15 @@ impl ValidateArgs for VerificationArgs {
                         "Conflicting options: --loop-bounds requires unwinding checks.",
                     ));
                 }
+                // Each harness's deadline is the policy's; a global timeout beside it would be a
+                // second, competing limit.
+                if self.harness_timeout.is_some() {
+                    return Err(Error::raw(
+                        ErrorKind::ArgumentConflict,
+                        "Conflicting options: --loop-bounds gives each harness its deadline; \
+                         --harness-timeout is refused beside it.",
+                    ));
+                }
                 // `old` runs CBMC without the per-harness report that records the resolution.
                 if self.output_format() == OutputFormat::Old {
                     return Err(Error::raw(
@@ -1339,6 +1348,8 @@ mod tests {
              --no-default-checks",
             "kani file.rs -Z unstable-options --loop-bounds b.json --loop-bounds-evidence e \
              --output-format=old",
+            "kani file.rs -Z unstable-options --loop-bounds b.json --loop-bounds-evidence e \
+             --harness-timeout 30m",
         ] {
             expect_validation_error(args, ErrorKind::ArgumentConflict);
         }

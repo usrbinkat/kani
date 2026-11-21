@@ -135,8 +135,11 @@ impl<'pr> HarnessRunner<'_, 'pr> {
                 // Update progress indicator if active
                 if progress_indicator.is_active() {
                     let succeeded = result.status == VerificationStatus::Success;
-                    let timed_out =
-                        matches!(&result.results, Err(crate::call_cbmc::ExitStatus::Timeout));
+                    let timed_out = matches!(
+                        &result.results,
+                        Err(crate::call_cbmc::ExitStatus::Timeout
+                            | crate::call_cbmc::ExitStatus::Deadline { .. })
+                    );
                     progress_indicator.update_with_result(succeeded, timed_out);
                 }
 

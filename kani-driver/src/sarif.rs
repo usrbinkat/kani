@@ -241,8 +241,9 @@ fn sarif_level(status: &CheckStatus) -> Option<&'static str> {
 fn exit_status_rule(exit_status: &ExitStatus) -> (&'static str, &'static str) {
     match exit_status {
         ExitStatus::Timeout => ("kani.cbmc.timeout", "CBMC timed out"),
-        ExitStatus::OutOfMemory => ("kani.cbmc.oom", "CBMC ran out of memory"),
-        ExitStatus::Other(_) => ("kani.cbmc.failed", "CBMC failed"),
+        ExitStatus::Deadline { .. } => ("kani.cbmc.deadline", "CBMC exceeded its deadline"),
+        ExitStatus::Exited(_) => ("kani.cbmc.failed", "CBMC failed"),
+        ExitStatus::Signaled(_) => ("kani.cbmc.signaled", "CBMC was terminated by a signal"),
     }
 }
 

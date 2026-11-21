@@ -11,18 +11,20 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use strum_macros::Display;
 use tokio::process::Command as TokioCommand;
 
 use crate::args::common::Verbosity;
 use crate::args::{OutputFormat, VerificationArgs};
 use crate::cbmc_output_parser::{
-    CheckStatus, ParserItem, Property, VerificationOutput, extract_results, process_cbmc_output,
+    CheckStatus, ParserItem, ProcessTermination, Property, VerificationOutput, extract_results,
+    process_cbmc_output,
 };
 use crate::cbmc_property_renderer::{format_coverage, format_result, kani_cbmc_output_filter};
 use crate::coverage::cov_results::{CoverageCheck, CoverageResults};
 use crate::coverage::cov_results::{CoverageRegion, CoverageTerm};
+use crate::loop_bounds::SolverTermination;
 use crate::session::KaniSession;
 use crate::util::render_command;
 
@@ -150,6 +152,10 @@ fn record_seconds(value: &str, field: &mut Option<f64>) -> bool {
     field.is_some()
 }
 
+/// The prefix of the report line of a run killed at its policy deadline
+/// ([`ExitStatus::Deadline`]), followed by the deadline in milliseconds.
+pub const DEADLINE_LINE: &str = "CBMC exceeded its deadline of ";
+
 /// We will use Cadical by default since it performed better than MiniSAT in our analysis.
 /// Note: Kissat was marginally better, but it is an external solver which could be more unstable.
 static DEFAULT_SOLVER: CbmcSolver = CbmcSolver::Cadical;
@@ -174,13 +180,20 @@ pub enum FailedProperties {
     Error,
 }
 
-/// The possible CBMC exit statuses
-#[derive(Clone, Copy, Debug)]
+/// How a CBMC run that produced no results ended. An exit code and a signal are kept apart, and
+/// neither is read as running out of memory: nothing CBMC or the operating system reports here
+/// establishes what ended the process.
+#[derive(Clone, Debug)]
 pub enum ExitStatus {
+    /// The run reached `--harness-timeout` and was killed.
     Timeout,
-    OutOfMemory,
-    /// the integer is the process exit status
-    Other(i32),
+    /// The run reached the deadline its `--loop-bounds` policy gives the harness and was killed;
+    /// the last status message CBMC reported before it, `None` when it reported none.
+    Deadline { milliseconds: u64, last_status_message: Option<String> },
+    /// CBMC exited with this code.
+    Exited(i32),
+    /// CBMC was terminated by this signal.
+    Signaled(i32),
 }
 
 /// Our (kani-driver) notions of CBMC results.
@@ -297,64 +310,45 @@ impl KaniSession {
                 file.display()
             ));
         }
-        // Spawn the CBMC process and process its output below
-        let mut cbmc_process =
-            cmd.spawn().map_err(|error| anyhow::anyhow!("Failed to run cbmc: {error}"))?;
-
-        let start_time = Instant::now();
-
-        let res = if let Some(timeout) = self.args.harness_timeout {
-            tokio::time::timeout(
-                timeout.into(),
-                process_cbmc_output(&mut cbmc_process, |i| {
-                    kani_cbmc_output_filter(
-                        i,
-                        self.args.extra_pointer_checks,
-                        self.args.common_args.quiet,
-                        &self.args.output_format(),
-                        self.args.log_file.as_ref(),
-                    )
-                }),
-            )
-            .await
-        } else {
-            Ok(process_cbmc_output(&mut cbmc_process, |i| {
-                kani_cbmc_output_filter(
-                    i,
-                    self.args.extra_pointer_checks,
-                    self.args.common_args.quiet,
-                    &self.args.output_format(),
-                    self.args.log_file.as_ref(),
-                )
+        // Under `--loop-bounds`, the harness's own deadline from the policy, which requires one of
+        // every harness verified and is refused beside `--harness-timeout`; otherwise that option.
+        let deadline = self
+            .loop_bounds
+            .as_ref()
+            .map(|bounds| {
+                bounds.policy.deadline(&harness.pretty_name).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("harness `{}` has no deadline", harness.pretty_name)
+                })
             })
-            .await)
+            .transpose()?;
+        let limit: Option<Duration> = match &deadline {
+            Some(deadline) => Some(Duration::from_millis(deadline.milliseconds)),
+            None => self.args.harness_timeout.map(Into::into),
+        };
+        let filter = |item: ParserItem| {
+            kani_cbmc_output_filter(
+                item,
+                self.args.extra_pointer_checks,
+                self.args.common_args.quiet,
+                &self.args.output_format(),
+                self.args.log_file.as_ref(),
+            )
         };
 
-        if let Ok(output) = res {
-            // The timeout wasn't reached
-            Ok(VerificationResult::from(
-                output?,
-                harness.attributes.should_panic,
-                start_time,
-                self.args.export_json.is_some(),
-            ))
-        } else {
-            // An error occurs if the timeout was reached
-
-            // Kill the process
-            cbmc_process.kill().await?;
-
-            Ok(VerificationResult {
-                status: VerificationStatus::Failure,
-                failed_properties: FailedProperties::None,
-                results: Err(ExitStatus::Timeout),
-                runtime: start_time.elapsed(),
-                generated_concrete_test: false,
-                ignored_quantifiers: 0,
-                coverage_results: None,
-                cbmc_stats: None,
-            })
+        let supervised = supervise(cmd, limit, filter).await?;
+        if let (Some(evidence), Some(deadline)) = (evidence, &deadline) {
+            evidence.execution(
+                deadline.milliseconds,
+                supervised.elapsed,
+                &supervised.termination,
+            )?;
         }
+        verification_of(
+            supervised,
+            deadline.map(|deadline| deadline.milliseconds),
+            harness.attributes.should_panic,
+            self.args.export_json.is_some(),
+        )
     }
 
     /// "Internal," but also used by call_cbmc_viewer
@@ -516,6 +510,146 @@ impl KaniSession {
     }
 }
 
+/// One supervised solver execution: CBMC's output when it ran to its end, the time from
+/// immediately after its spawn to its end, and how it ended ([`SolverTermination`]).
+pub(crate) struct Supervised {
+    pub output: Option<VerificationOutput>,
+    pub elapsed: Duration,
+    pub termination: SolverTermination,
+}
+
+/// Spawn `cmd` and read its output through `filter` until it ends or `limit` passes. One
+/// monotonic start is taken immediately after the spawn returns, and the absolute deadline is
+/// computed from it; the elapsed time ends at normal completion, at the deadline's detection, or at
+/// an execution error. At the deadline, CBMC's last status message is kept, the process is killed
+/// and reaped, and the time and any error of that cleanup are recorded apart. A spawn that fails
+/// is an error: no execution began.
+pub(crate) async fn supervise(
+    mut cmd: TokioCommand,
+    limit: Option<Duration>,
+    mut filter: impl FnMut(ParserItem) -> Option<ParserItem>,
+) -> Result<Supervised> {
+    let mut child = cmd.spawn().map_err(|error| anyhow::anyhow!("Failed to run cbmc: {error}"))?;
+    let start = tokio::time::Instant::now();
+    let deadline = match limit.map(|limit| start.checked_add(limit)) {
+        Some(Some(at)) => Some(at),
+        Some(None) => {
+            let elapsed = start.elapsed();
+            let cleanup = child.kill().await;
+            return Ok(Supervised {
+                output: None,
+                elapsed,
+                termination: SolverTermination::ExecutionError {
+                    operation: "computing the deadline".to_string(),
+                    diagnostic: format!(
+                        "the deadline of {limit:?} past the start does not fit the clock{}",
+                        cleanup
+                            .err()
+                            .map(|error| format!("; terminating CBMC: {error}"))
+                            .unwrap_or_default()
+                    ),
+                },
+            });
+        }
+        None => None,
+    };
+    let last_status = std::cell::RefCell::new(None::<String>);
+    let tracked = |item: ParserItem| {
+        if let ParserItem::Message { message_text, message_type } = &item
+            && message_type == "STATUS-MESSAGE"
+        {
+            *last_status.borrow_mut() = Some(message_text.clone());
+        }
+        filter(item)
+    };
+    let read = match deadline {
+        Some(at) => tokio::time::timeout_at(at, process_cbmc_output(&mut child, tracked)).await,
+        None => Ok(process_cbmc_output(&mut child, tracked).await),
+    };
+    let elapsed = start.elapsed();
+    Ok(match read {
+        Ok(Ok(output)) => Supervised {
+            termination: match output.termination {
+                ProcessTermination::Exited { code } => SolverTermination::Exited { code },
+                ProcessTermination::Signaled { signal } => SolverTermination::Signaled { signal },
+            },
+            output: Some(output),
+            elapsed,
+        },
+        Ok(Err(error)) => Supervised {
+            output: None,
+            elapsed,
+            termination: SolverTermination::ExecutionError {
+                operation: "reading CBMC's output and reaping it".to_string(),
+                diagnostic: format!("{error:#}"),
+            },
+        },
+        Err(_) => {
+            let last_status_message = last_status.into_inner();
+            let detected = tokio::time::Instant::now();
+            let cleanup = child.kill().await;
+            Supervised {
+                output: None,
+                elapsed,
+                termination: SolverTermination::Deadline {
+                    last_status_message,
+                    cleanup_elapsed: detected.elapsed().into(),
+                    cleanup_error: cleanup.err().map(|error| error.to_string()),
+                },
+            }
+        }
+    })
+}
+
+/// The verification result of a supervised execution: CBMC's results when it ran to its end;
+/// no verdict when it was killed at its `deadline` (`--loop-bounds`) or `--harness-timeout`. A
+/// deadline whose cleanup failed, and an execution error, are errors: no result is accepted from
+/// them.
+pub(crate) fn verification_of(
+    supervised: Supervised,
+    deadline: Option<u64>,
+    should_panic: bool,
+    collect_cbmc_stats: bool,
+) -> Result<VerificationResult> {
+    let results = match supervised.termination {
+        SolverTermination::Exited { .. } | SolverTermination::Signaled { .. } => {
+            let output = supervised
+                .output
+                .ok_or_else(|| anyhow::anyhow!("a CBMC run that ended has no output"))?;
+            return Ok(VerificationResult::from(
+                output,
+                should_panic,
+                supervised.elapsed,
+                collect_cbmc_stats,
+            ));
+        }
+        SolverTermination::Deadline { cleanup_error: Some(error), .. } => {
+            bail!("CBMC could not be terminated at its deadline: {error}")
+        }
+        SolverTermination::Deadline { last_status_message, cleanup_error: None, .. } => {
+            match deadline {
+                Some(milliseconds) => {
+                    Err(ExitStatus::Deadline { milliseconds, last_status_message })
+                }
+                None => Err(ExitStatus::Timeout),
+            }
+        }
+        SolverTermination::ExecutionError { operation, diagnostic } => {
+            bail!("CBMC's execution failed {operation}: {diagnostic}")
+        }
+    };
+    Ok(VerificationResult {
+        status: VerificationStatus::Failure,
+        failed_properties: FailedProperties::None,
+        results,
+        runtime: supervised.elapsed,
+        generated_concrete_test: false,
+        ignored_quantifiers: 0,
+        coverage_results: None,
+        cbmc_stats: None,
+    })
+}
+
 /// Count CBMC messages reporting that a quantifier expression could not be encoded and was
 /// dropped. CBMC's SAT-based backends only support quantifiers with constant bounds; other
 /// quantifiers are replaced by unconstrained values, with only a low-visibility message
@@ -556,10 +690,9 @@ impl VerificationResult {
     fn from(
         output: VerificationOutput,
         should_panic: bool,
-        start_time: Instant,
+        runtime: Duration,
         collect_cbmc_stats: bool,
     ) -> VerificationResult {
-        let runtime = start_time.elapsed();
         let ignored_quantifiers = count_ignored_quantifiers(&output.processed_items);
         let (remaining_items, results) = extract_results(output.processed_items);
 
@@ -591,10 +724,9 @@ impl VerificationResult {
             }
         } else {
             // We never got results from CBMC - something went wrong (e.g. crash) so it's failure
-            let exit_status = if output.process_status == 137 {
-                ExitStatus::OutOfMemory
-            } else {
-                ExitStatus::Other(output.process_status)
+            let exit_status = match output.termination {
+                ProcessTermination::Exited { code } => ExitStatus::Exited(code),
+                ProcessTermination::Signaled { signal } => ExitStatus::Signaled(signal),
             };
             VerificationResult {
                 status: VerificationStatus::Failure,
@@ -629,7 +761,7 @@ impl VerificationResult {
             // on failure, exit codes in theory might be used,
             // but `mock_failure` should never be used in a context where they will,
             // so again use something weird:
-            results: Err(ExitStatus::Other(42)),
+            results: Err(ExitStatus::Exited(42)),
             runtime: Duration::from_secs(0),
             generated_concrete_test: false,
             ignored_quantifiers: 0,
@@ -677,20 +809,36 @@ impl VerificationResult {
             Err(exit_status) => {
                 let verification_result = console::style("FAILED").red();
                 let (header, explanation) = match exit_status {
-                    ExitStatus::OutOfMemory => (
-                        String::from("CBMC failed"),
-                        "CBMC appears to have run out of memory. You may want to rerun your proof in \
-                    an environment with additional memory or use stubbing to reduce the size of the \
-                    code the verifier reasons about.\n",
-                    ),
                     ExitStatus::Timeout => (
                         String::from("CBMC failed"),
-                        "CBMC timed out. You may want to rerun your proof with a larger timeout \
-                    or use stubbing to reduce the size of the code the verifier reasons about.\n",
+                        String::from(
+                            "CBMC reached --harness-timeout and the harness has no verdict. The \
+                             run cost more than the limit: right-size the harness's domain or the \
+                             code it reasons about, or find the defect that made it cost more.\n",
+                        ),
                     ),
-                    ExitStatus::Other(exit_status) => {
-                        (format!("CBMC failed with status {exit_status}"), "")
+                    ExitStatus::Deadline { milliseconds, last_status_message } => (
+                        format!("{DEADLINE_LINE}{milliseconds} ms"),
+                        format!(
+                            "The run was killed at its deadline and the harness has no verdict. \
+                             It cost more than its policy allows over its supported expectation: \
+                             the harness is wrongly sized for the expectation, the expectation is \
+                             wrong, or the code it checks regressed; an expectation is never \
+                             raised solely to turn the run green. CBMC's last status message: \
+                             {}\n",
+                            last_status_message.as_deref().unwrap_or("none")
+                        ),
+                    ),
+                    ExitStatus::Exited(code) => {
+                        (format!("CBMC failed with status {code}"), String::new())
                     }
+                    ExitStatus::Signaled(signal) => (
+                        format!("CBMC failed: terminated by signal {signal}"),
+                        String::from(
+                            "The signal's sender is not established by its number; the harness \
+                             has no verdict.\n",
+                        ),
+                    ),
                 };
                 format!(
                     "\n{header}\n\
@@ -893,6 +1041,89 @@ mod tests {
     #[test]
     fn check_cbmc_stats_absent() {
         assert!(merge_cbmc_stats(&[]).is_none());
+    }
+
+    /// `script` run by `sh` under `limit`, supervised as CBMC is.
+    fn supervised(script: &str, limit: Option<Duration>) -> Supervised {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut cmd = TokioCommand::new("sh");
+        cmd.args(["-c", script]).stdout(std::process::Stdio::piped());
+        runtime.block_on(supervise(cmd, limit, Some)).unwrap()
+    }
+
+    /// An exit code of 137 and a SIGKILL are different terminations, each kept as it happened,
+    /// and neither is reported as running out of memory.
+    #[test]
+    fn an_exit_and_a_signal_are_kept_apart() {
+        let exited = supervised("exit 137", None);
+        assert_eq!(exited.termination, SolverTermination::Exited { code: 137 });
+        let result = verification_of(exited, None, false, false).unwrap();
+        assert!(matches!(result.results, Err(ExitStatus::Exited(137))));
+        let rendered = result.render(&OutputFormat::Regular, false);
+        assert!(rendered.contains("CBMC failed with status 137"), "{rendered}");
+        assert!(!rendered.contains("memory"), "{rendered}");
+        let killed = supervised("kill -9 $$", None);
+        assert_eq!(killed.termination, SolverTermination::Signaled { signal: 9 });
+        let result = verification_of(killed, None, false, false).unwrap();
+        assert!(matches!(result.results, Err(ExitStatus::Signaled(9))));
+        let rendered = result.render(&OutputFormat::Regular, false);
+        assert!(rendered.contains("CBMC failed: terminated by signal 9"), "{rendered}");
+        assert!(!rendered.contains("memory"), "{rendered}");
+    }
+
+    /// A run that outlives its limit is detected at it, killed and reaped, the time to its
+    /// detection and the time of its cleanup measured apart; under a policy deadline it is a
+    /// deadline, otherwise `--harness-timeout`'s timeout, and either has no verdict.
+    #[test]
+    fn a_deadline_is_detected_then_cleaned_up_apart() {
+        let limit = Duration::from_millis(100);
+        let found = supervised("sleep 30", Some(limit));
+        assert!(
+            found.elapsed >= limit && found.elapsed < Duration::from_secs(30),
+            "{:?}",
+            found.elapsed
+        );
+        let SolverTermination::Deadline { cleanup_error: None, cleanup_elapsed, .. } =
+            &found.termination
+        else {
+            panic!("not a cleaned-up deadline: {:?}", found.termination);
+        };
+        assert!(Duration::new(cleanup_elapsed.seconds, cleanup_elapsed.nanoseconds) < limit);
+        let result = verification_of(found, Some(100), false, false).unwrap();
+        assert!(matches!(
+            result.results,
+            Err(ExitStatus::Deadline { milliseconds: 100, last_status_message: None })
+        ));
+        assert_eq!(result.status, VerificationStatus::Failure);
+        let timed_out = verification_of(supervised("sleep 30", Some(limit)), None, false, false);
+        assert!(matches!(timed_out.unwrap().results, Err(ExitStatus::Timeout)));
+    }
+
+    /// A deadline whose cleanup failed, and an execution error, are never accepted as a
+    /// termination with a result.
+    #[test]
+    fn a_failed_cleanup_or_execution_is_never_a_result() {
+        let cleanup = Supervised {
+            output: None,
+            elapsed: Duration::from_millis(5),
+            termination: SolverTermination::Deadline {
+                last_status_message: None,
+                cleanup_elapsed: Duration::ZERO.into(),
+                cleanup_error: Some("no such process".to_string()),
+            },
+        };
+        let error = verification_of(cleanup, Some(5), false, false).unwrap_err().to_string();
+        assert!(error.contains("could not be terminated at its deadline"), "{error}");
+        let execution = Supervised {
+            output: None,
+            elapsed: Duration::ZERO,
+            termination: SolverTermination::ExecutionError {
+                operation: "reading".to_string(),
+                diagnostic: "broken pipe".to_string(),
+            },
+        };
+        let error = verification_of(execution, Some(5), false, false).unwrap_err().to_string();
+        assert!(error.contains("CBMC's execution failed reading: broken pipe"), "{error}");
     }
 
     #[test]

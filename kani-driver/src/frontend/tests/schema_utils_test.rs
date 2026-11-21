@@ -218,7 +218,7 @@ fn test_add_runner_results_to_json_real() {
     let verification_result = VerificationResult {
         status: VerificationStatus::Failure,
         failed_properties: FailedProperties::Other,
-        results: Err(ExitStatus::Other(42)),
+        results: Err(ExitStatus::Exited(42)),
         runtime: Duration::from_millis(120),
         generated_concrete_test: false,
         ignored_quantifiers: 0,

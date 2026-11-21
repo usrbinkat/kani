@@ -49,6 +49,20 @@
 //! parts), the driver and solver executables (canonical path and SHA-256 digest), and the launch
 //! attempt are recorded, in files and in the harness's report, immediately before CBMC is spawned:
 //! a refused policy leaves its discovery and its error and no attempt.
+//!
+//! Deadlines: the policy gives every harness the run verifies its own deadline (`deadlines`, the
+//! milliseconds and the reason they follow from the harness's domain), and `--harness-timeout` is
+//! refused beside it. Every solver execution that reaches spawn records one timing record
+//! (`solver.execution.json`): the deadline it was given, the time from immediately after CBMC
+//! was spawned to its end (CBMC's output read to its end and its exit reaped, the deadline's
+//! detection, or an execution error; compilation, instrumentation, preservation and discovery
+//! come before it, rendering after), and how it ended: CBMC's exit code or signal, kept apart;
+//! the deadline, with CBMC's last status message and the separate time of its termination and
+//! reaping; or the driver's execution error. A run that reaches its deadline has no verdict. A
+//! breach shows that the harness is wrongly sized for its expectation, that the expectation is
+//! wrong, or that the code it checks regressed. An expectation is never raised solely to turn a
+//! failed run green: a correction needs its own justification, the failure is kept, and the run is
+//! repeated.
 
 use anyhow::{Context, Result, bail};
 use kani_metadata::HarnessMetadata;
@@ -70,13 +84,26 @@ pub const BOUND_LINE: &str = "Loop bound: ";
 pub const LAUNCH_LINE: &str = "CBMC launch attempt: ";
 
 /// A `--loop-bounds` file: the loops whose bound is a property of the code that holds them, each
-/// applied in every harness whose binary holds its function, and the harnesses that take loop
-/// bounds of their own.
+/// applied in every harness whose binary holds its function, the harnesses that take loop
+/// bounds of their own, and each harness's deadline.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     pub loops: Vec<Selector>,
     pub harnesses: Vec<HarnessPolicy>,
+    pub deadlines: Vec<Deadline>,
+}
+
+/// The longest one harness's CBMC run may take, measured from immediately after CBMC is spawned,
+/// and why: the caller's margin over the run's supported expectation. A run that reaches it is
+/// killed and has no verdict ([`SolverTermination::Deadline`]); a deadline is never evidence of a
+/// proof, and an expectation is never raised solely to turn a failed run green.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Deadline {
+    pub harness: String,
+    pub milliseconds: u64,
+    pub reason: String,
 }
 
 /// One harness's loop bounds, the harness named by its fully qualified pretty name.
@@ -149,6 +176,19 @@ impl Policy {
                 );
             }
         }
+        let mut deadlines = BTreeSet::new();
+        for deadline in &policy.deadlines {
+            let scope = format!("the deadline of harness `{}`", deadline.harness);
+            if !deadlines.insert(deadline.harness.as_str()) {
+                bail!("{scope} is declared more than once");
+            }
+            if deadline.milliseconds == 0 {
+                bail!("{scope} is zero milliseconds");
+            }
+            if deadline.reason.trim().is_empty() {
+                bail!("{scope} gives no reason");
+            }
+        }
         Ok(policy)
     }
 
@@ -162,10 +202,20 @@ impl Policy {
             .harnesses
             .iter()
             .map(|entry| entry.harness.as_str())
+            .chain(self.deadlines.iter().map(|deadline| deadline.harness.as_str()))
             .filter(|name| !known.contains(name))
             .collect();
         if !unknown.is_empty() {
             bail!("the loop-bounds file names harnesses this run does not verify: {unknown:?}");
+        }
+        // Every harness verified has its own deadline: none falls back to an unbounded run or to
+        // another harness's.
+        let undated: Vec<&str> =
+            known.iter().copied().filter(|name| self.deadline(name).is_none()).collect();
+        if !undated.is_empty() {
+            bail!(
+                "the loop-bounds file gives no deadline to harnesses this run verifies: {undated:?}"
+            );
         }
         Ok(())
     }
@@ -173,6 +223,12 @@ impl Policy {
     /// The bounds of `harness`, if the policy has any.
     pub fn for_harness(&self, harness: &str) -> Option<&HarnessPolicy> {
         self.harnesses.iter().find(|entry| entry.harness == harness)
+    }
+
+    /// The deadline of `harness` ([`Self::check_harnesses`] requires one of every harness a run
+    /// verifies).
+    pub fn deadline(&self, harness: &str) -> Option<&Deadline> {
+        self.deadlines.iter().find(|deadline| deadline.harness == harness)
     }
 }
 
@@ -349,6 +405,45 @@ impl LoopBounds {
     }
 }
 
+/// A duration as evidence: whole seconds and the nanoseconds below one second, integers, so the
+/// record carries the driver's measurement exactly; no clock instant is recorded, since a
+/// monotonic instant means nothing outside the process that took it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Elapsed {
+    pub seconds: u64,
+    pub nanoseconds: u32,
+}
+
+impl From<std::time::Duration> for Elapsed {
+    fn from(duration: std::time::Duration) -> Self {
+        Self { seconds: duration.as_secs(), nanoseconds: duration.subsec_nanos() }
+    }
+}
+
+/// How one solver execution ended ([`HarnessEvidence::execution`]): CBMC's own exit or signal;
+/// killed at its deadline, with CBMC's last status message, the time from the deadline's
+/// detection through CBMC's termination and reaping, and the error of that termination if it
+/// failed; or an execution error of the driver's, with the operation that failed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SolverTermination {
+    Exited {
+        code: i32,
+    },
+    Signaled {
+        signal: i32,
+    },
+    Deadline {
+        last_status_message: Option<String>,
+        cleanup_elapsed: Elapsed,
+        cleanup_error: Option<String>,
+    },
+    ExecutionError {
+        operation: String,
+        diagnostic: String,
+    },
+}
+
 /// One harness's evidence directory ([`LoopBounds::reserve`]).
 #[derive(Debug)]
 pub struct HarnessEvidence {
@@ -408,6 +503,23 @@ impl HarnessEvidence {
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
             .with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    /// Record the harness's one solver execution (`solver.execution.json`, created exclusively):
+    /// the deadline the run was given, the time from immediately after CBMC was spawned to its
+    /// end (normal completion, the deadline's detection, or an execution error), and how it ended.
+    pub fn execution(
+        &self,
+        deadline_milliseconds: u64,
+        elapsed: std::time::Duration,
+        termination: &SolverTermination,
+    ) -> Result<()> {
+        let record = serde_json::json!({
+            "deadline_milliseconds": deadline_milliseconds,
+            "elapsed": Elapsed::from(elapsed),
+            "termination": termination,
+        });
+        self.write("solver.execution.json", serde_json::to_string_pretty(&record)?.as_bytes())
     }
 
     /// Record the command CBMC is about to be spawned as, its program and arguments read from the
@@ -855,17 +967,24 @@ mod tests {
         ], "harnesses": [{"harness": "h", "loops": [
             {"function": "pair", "file": "demo.rs", "loops_in_function": 2, "loop": 1, "bound": 4,
              "reason": "the test's"}
-        ]}]}"#;
+        ]}], "deadlines": [{"harness": "h", "milliseconds": 2000, "reason": "twice 1 s"}]}"#;
         let policy = Policy::parse(valid).unwrap();
         assert_eq!(policy.harnesses[0].loops[0], selector("pair", 2, 1, 4));
         assert_eq!(policy.loops[0].function, "count_up");
+        assert_eq!(policy.deadline("h").unwrap().milliseconds, 2000);
+        assert!(policy.deadline("g").is_none());
         let entry = |loops: &str| format!(r#"{{"harness": "h", "loops": [{loops}]}}"#);
         let bound = |function: &str, file: &str, count: u32, number: u32| {
             format!(
                 r#"{{"function": "{function}", "file": "{file}", "loops_in_function": {count}, "loop": {number}, "bound": 1, "reason": "r"}}"#
             )
         };
-        let harnesses = |entries: &str| format!(r#"{{"loops": [], "harnesses": [{entries}]}}"#);
+        let harnesses = |entries: &str| {
+            format!(r#"{{"loops": [], "harnesses": [{entries}], "deadlines": []}}"#)
+        };
+        let deadlines = |entries: &str| {
+            format!(r#"{{"loops": [], "harnesses": [], "deadlines": [{entries}]}}"#)
+        };
         for (text, expected) in [
             (
                 harnesses(&format!(
@@ -901,7 +1020,7 @@ mod tests {
             ),
             (
                 format!(
-                    r#"{{"loops": [{}, {}], "harnesses": []}}"#,
+                    r#"{{"loops": [{}, {}], "harnesses": [], "deadlines": []}}"#,
                     bound("f", "a.rs", 1, 0),
                     bound("f", "a.rs", 1, 0)
                 ),
@@ -909,17 +1028,123 @@ mod tests {
             ),
             (
                 format!(
-                    r#"{{"loops": [{}], "harnesses": [{}]}}"#,
+                    r#"{{"loops": [{}], "harnesses": [{}], "deadlines": []}}"#,
                     bound("f", "a.rs", 1, 0),
                     entry(&bound("f", "a.rs", 1, 0))
                 ),
                 "is bounded by the function scope too",
             ),
-            (r#"{"harnesses": []}"#.to_string(), "missing field `loops`"),
-            (r#"{"loops": [], "harnesses": [], "unknown": 1}"#.to_string(), "unknown field"),
+            (
+                deadlines(
+                    r#"{"harness": "h", "milliseconds": 1, "reason": "r"},
+                       {"harness": "h", "milliseconds": 2, "reason": "r"}"#,
+                ),
+                "the deadline of harness `h` is declared more than once",
+            ),
+            (
+                deadlines(r#"{"harness": "h", "milliseconds": 0, "reason": "r"}"#),
+                "the deadline of harness `h` is zero milliseconds",
+            ),
+            (
+                deadlines(r#"{"harness": "h", "milliseconds": 1, "reason": " "}"#),
+                "the deadline of harness `h` gives no reason",
+            ),
+            (r#"{"harnesses": [], "deadlines": []}"#.to_string(), "missing field `loops`"),
+            (r#"{"loops": [], "harnesses": []}"#.to_string(), "missing field `deadlines`"),
+            (
+                r#"{"loops": [], "harnesses": [], "deadlines": [], "unknown": 1}"#.to_string(),
+                "unknown field",
+            ),
         ] {
             let found = format!("{:#}", Policy::parse(&text).unwrap_err());
             assert!(found.contains(expected), "{expected}: {found}");
+        }
+    }
+
+    /// Every harness a run verifies has its own deadline, and every deadline names one of them:
+    /// a harness without one, or a deadline of a harness the run does not verify, is refused.
+    #[test]
+    fn every_verified_harness_has_its_deadline() {
+        let policy = |names: &[&str]| {
+            let deadlines: Vec<String> = names
+                .iter()
+                .map(|name| format!(r#"{{"harness": "{name}", "milliseconds": 1, "reason": "r"}}"#))
+                .collect();
+            Policy::parse(&format!(
+                r#"{{"loops": [], "harnesses": [], "deadlines": [{}]}}"#,
+                deadlines.join(", ")
+            ))
+            .unwrap()
+        };
+        let a = crate::metadata::tests::mock_proof_harness("a", None, None, None);
+        let b = crate::metadata::tests::mock_proof_harness("b", None, None, None);
+        policy(&["a", "b"]).check_harnesses(&[&a, &b]).unwrap();
+        let undated = policy(&["a"]).check_harnesses(&[&a, &b]).unwrap_err().to_string();
+        assert!(
+            undated.contains(r#"gives no deadline to harnesses this run verifies: ["b"]"#),
+            "{undated}"
+        );
+        let unknown = policy(&["a", "c"]).check_harnesses(&[&a]).unwrap_err().to_string();
+        assert!(
+            unknown.contains(r#"names harnesses this run does not verify: ["c"]"#),
+            "{unknown}"
+        );
+    }
+
+    /// The execution record holds the deadline, the exact elapsed duration as integer seconds and
+    /// nanoseconds, and the tagged termination; it is created once, and a second record is
+    /// refused with the first left as it was.
+    #[test]
+    fn an_execution_is_recorded_once_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let evidence = HarnessEvidence { directory: root.path().to_path_buf() };
+        let termination = SolverTermination::Deadline {
+            last_status_message: Some("Running Symex".to_string()),
+            cleanup_elapsed: Elapsed { seconds: 0, nanoseconds: 2_000_001 },
+            cleanup_error: None,
+        };
+        evidence.execution(2000, std::time::Duration::new(2, 123_456_789), &termination).unwrap();
+        let path = root.path().join("solver.execution.json");
+        let first = std::fs::read(&path).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(
+            record,
+            serde_json::json!({
+                "deadline_milliseconds": 2000,
+                "elapsed": {"seconds": 2, "nanoseconds": 123_456_789},
+                "termination": {
+                    "kind": "deadline",
+                    "last_status_message": "Running Symex",
+                    "cleanup_elapsed": {"seconds": 0, "nanoseconds": 2_000_001},
+                    "cleanup_error": null,
+                },
+            })
+        );
+        let again = evidence.execution(
+            1,
+            std::time::Duration::ZERO,
+            &SolverTermination::Exited { code: 0 },
+        );
+        assert!(format!("{:#}", again.unwrap_err()).starts_with("failed to create"));
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        for (termination, json) in [
+            (
+                SolverTermination::Exited { code: 137 },
+                serde_json::json!({"kind": "exited", "code": 137}),
+            ),
+            (
+                SolverTermination::Signaled { signal: 9 },
+                serde_json::json!({"kind": "signaled", "signal": 9}),
+            ),
+            (
+                SolverTermination::ExecutionError {
+                    operation: "o".to_string(),
+                    diagnostic: "d".to_string(),
+                },
+                serde_json::json!({"kind": "execution_error", "operation": "o", "diagnostic": "d"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&termination).unwrap(), json);
         }
     }
 
