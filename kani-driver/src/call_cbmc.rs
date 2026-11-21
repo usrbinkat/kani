@@ -215,24 +215,31 @@ pub struct VerificationResult {
 impl KaniSession {
     /// Verify a goto binary that's been prepared with goto-instrument
     pub fn run_cbmc(&self, file: &Path, harness: &HarnessMetadata) -> Result<VerificationResult> {
-        let mut args: Vec<OsString> = self.cbmc_flags(file, harness)?;
-
-        // The harness's loop bounds, resolved against `file` as instrumentation left it, each step
-        // recorded in the harness's own evidence before the next reads it, and applied to this
-        // run's arguments alone (harnesses may be checked in parallel).
+        // Under `--loop-bounds`, the harness's evidence is reserved and `file`, as instrumentation
+        // left it, preserved into it before anything reads it; the preserved copy is the one
+        // binary the arguments, the loop discovery, the resolution and the solver then name.
         let evidence = match &self.loop_bounds {
             Some(bounds) => {
                 let evidence = bounds.reserve(harness)?;
-                if let Some((lines, unwindset)) = bounds.apply(harness, file, &evidence)? {
-                    for line in lines {
-                        self.emit_harness_line(&line);
-                    }
-                    args.extend(unwindset);
-                }
-                Some(evidence)
+                let artifact = evidence.preserve_artifact(file)?;
+                Some((bounds, evidence, artifact))
             }
             None => None,
         };
+        let file = evidence.as_ref().map_or(file, |(_, _, artifact)| artifact.path.as_path());
+        let mut args: Vec<OsString> = self.cbmc_flags(file, harness)?;
+
+        // The harness's loop bounds, resolved against the preserved binary, each step recorded in
+        // the harness's own evidence before the next reads it, and applied to this run's
+        // arguments alone (harnesses may be checked in parallel).
+        if let Some((bounds, evidence, artifact)) = &evidence
+            && let Some((lines, unwindset)) = bounds.apply(harness, artifact, evidence)?
+        {
+            for line in lines {
+                self.emit_harness_line(&line);
+            }
+            args.extend(unwindset);
+        }
 
         // The solver, resolved once on the PATH the command would search, the bundle's own
         // first, and canonicalized: the command spawns this executable, so its record names
@@ -259,7 +266,8 @@ impl KaniSession {
             // TODO: move this now that we don't use --visualize
             cmd.arg("--json-ui");
 
-            self.runtime.block_on(self.run_cbmc_piped(cmd, harness, file, evidence.as_ref()))?
+            let evidence = evidence.as_ref().map(|(_, evidence, _)| evidence);
+            self.runtime.block_on(self.run_cbmc_piped(cmd, harness, file, evidence))?
         };
 
         Ok(verification_results)

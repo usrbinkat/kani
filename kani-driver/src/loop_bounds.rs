@@ -33,7 +33,12 @@
 //! Evidence: the caller names a directory it owns (`--loop-bounds-evidence`); every harness
 //! verified in the run gets a subdirectory of its own, named by its pretty name with `::` written
 //! `.`, created exclusively, as is every file in it, so an existing destination is an error and
-//! nothing is ever truncated. For a harness the policy bounds, the discovery's invocation,
+//! nothing is ever truncated. Every harness's instrumented binary is first copied into its
+//! directory (`artifact.out`, recorded with its build path and digest in `artifact.json`), and that
+//! copy is the one binary the harness's run reads from then on: the build directory may be
+//! rewritten by a later run or another instrumentation of the same path without changing what was
+//! checked, and the copy survives a refused resolution or a failed verification for replay. For
+//! a harness the policy bounds, the discovery's invocation,
 //! termination, stdout and stderr are written before they are parsed; then the resolution (the
 //! harness, its policy entry, the binary's SHA-256 digest and each resolved loop with its source
 //! location), or the error that refused it. For every harness, the final CBMC command (NUL-ended
@@ -214,25 +219,25 @@ impl LoopBounds {
         Ok(HarnessEvidence { directory })
     }
 
-    /// The bounds the policy declares for `harness`, resolved against the binary at `file`, every
-    /// step's evidence written into `evidence` before the next step reads it: the lines reporting
-    /// the resolution, then the CBMC arguments applying it. `None` when the harness has no bounds.
+    /// The bounds the policy declares for `harness`, resolved against `artifact`, the harness's
+    /// preserved binary ([`HarnessEvidence::preserve_artifact`]), every step's evidence written
+    /// into `evidence` before the next step reads it: the lines reporting the resolution, then
+    /// the CBMC arguments applying it. `None` when the harness has no bounds.
     pub fn apply(
         &self,
         harness: &HarnessMetadata,
-        file: &Path,
+        artifact: &Artifact,
         evidence: &HarnessEvidence,
     ) -> Result<Option<(Vec<String>, Vec<OsString>)>> {
         let Some(entry) = self.policy.for_harness(&harness.pretty_name) else {
             return Ok(None);
         };
-        let text = evidence.discover(file)?;
+        let text = evidence.discover(&artifact.path)?;
         let resolution = parse_inventory(&text).and_then(|(loops, warnings)| {
             let resolved = resolve(entry, &loops)?;
-            let digest = digest(file)?;
-            Ok((warnings, resolved, digest))
+            Ok((warnings, resolved))
         });
-        let (warnings, resolved, digest) = match resolution {
+        let (warnings, resolved) = match resolution {
             Ok(resolution) => resolution,
             Err(error) => {
                 evidence.write("resolution.error", format!("{error:#}\n").as_bytes())?;
@@ -241,12 +246,16 @@ impl LoopBounds {
         };
         let mut lines = Vec::with_capacity(resolved.len() + warnings.len() + 1);
         lines.extend(warnings.iter().map(|warning| format!("Loop inventory warning: {warning}")));
-        lines.push(format!("{ARTIFACT_LINE}{} sha256:{digest}", file.display()));
+        lines.push(format!(
+            "{ARTIFACT_LINE}{} sha256:{}",
+            artifact.path.display(),
+            artifact.sha256
+        ));
         lines.extend(resolved.iter().map(Resolved::render));
         let record = serde_json::json!({
             "harness": harness.pretty_name,
             "policy": entry,
-            "artifact": { "path": file, "sha256": digest },
+            "artifact": { "path": artifact.path, "sha256": artifact.sha256 },
             "warnings": warnings,
             "resolved": resolved.iter().map(|entry| serde_json::json!({
                 "selector": entry.selector,
@@ -265,7 +274,48 @@ pub struct HarnessEvidence {
     directory: PathBuf,
 }
 
+/// A harness's instrumented binary as its evidence holds it: the preserved copy every step of the
+/// harness's run reads, and that copy's SHA-256 digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Artifact {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
 impl HarnessEvidence {
+    /// The instrumented binary at `source`, copied byte for byte into this directory's
+    /// `artifact.out`, created exclusively, flushed and synchronized, and recorded with its
+    /// origin in `artifact.json` (`source`, the build path it was copied from; `path`; `sha256`,
+    /// the copy's digest). The copy is what discovery, resolution and the solver then read, so a
+    /// later rewrite of the build directory, by another run or another instrumentation of the same
+    /// path, cannot change what this harness was checked on, and the copy outlives the run
+    /// whatever its outcome.
+    pub fn preserve_artifact(&self, source: &Path) -> Result<Artifact> {
+        let path = self.directory.join("artifact.out");
+        let mut preserved = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        let mut original = std::fs::File::open(source).with_context(|| {
+            format!("failed to open the instrumented binary {}", source.display())
+        })?;
+        std::io::copy(&mut original, &mut preserved)
+            .and_then(|_| preserved.flush())
+            .and_then(|()| preserved.sync_all())
+            .with_context(|| {
+                format!("failed to preserve {} as {}", source.display(), path.display())
+            })?;
+        let artifact = Artifact { sha256: digest(&path)?, path };
+        let record = serde_json::json!({
+            "source": source,
+            "path": artifact.path,
+            "sha256": artifact.sha256,
+        });
+        self.write("artifact.json", serde_json::to_string_pretty(&record)?.as_bytes())?;
+        Ok(artifact)
+    }
+
     /// Write `bytes` to `name` in this directory, refusing an existing file.
     pub fn write(&self, name: &str, bytes: &[u8]) -> Result<()> {
         let path = self.directory.join(name);
@@ -773,6 +823,46 @@ mod tests {
             let found = format!("{:#}", Policy::parse(&text).unwrap_err());
             assert!(found.contains(expected), "{expected}: {found}");
         }
+    }
+
+    /// An instrumented binary is preserved once, byte for byte: a later change to its build path
+    /// leaves the copy, and the digest every later step names, unchanged; an existing
+    /// `artifact.out` is refused and left as it was.
+    #[test]
+    fn an_artifact_is_preserved_once_and_survives_its_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("harness.out");
+        std::fs::write(&source, b"instrumented").unwrap();
+        let evidence = HarnessEvidence { directory: root.path().join("h") };
+        std::fs::create_dir(&evidence.directory).unwrap();
+        let artifact = evidence.preserve_artifact(&source).unwrap();
+        assert_eq!(artifact.path, evidence.directory.join("artifact.out"));
+        assert_eq!(artifact.sha256, digest(&source).unwrap());
+        std::fs::write(&source, b"rewritten by a later run").unwrap();
+        assert_eq!(std::fs::read(&artifact.path).unwrap(), b"instrumented");
+        assert_eq!(digest(&artifact.path).unwrap(), artifact.sha256);
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(evidence.directory.join("artifact.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["source"], source.display().to_string());
+        assert_eq!(record["path"], artifact.path.display().to_string());
+        assert_eq!(record["sha256"], artifact.sha256);
+        // The second preservation is refused by `artifact.out`'s own exclusive creation, before
+        // anything is copied: not by a later record's.
+        let error = format!("{:#}", evidence.preserve_artifact(&source).unwrap_err());
+        let refused = format!("failed to create {}", artifact.path.display());
+        assert!(error.starts_with(&refused), "{error}");
+        assert_eq!(std::fs::read(&artifact.path).unwrap(), b"instrumented");
+        // A binary that cannot be read is refused: no step can run on a copy that is not one.
+        let missing = HarnessEvidence { directory: root.path().join("missing") };
+        std::fs::create_dir(&missing.directory).unwrap();
+        let error = missing.preserve_artifact(&root.path().join("absent.out")).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("failed to open the instrumented binary"),
+            "{error:#}"
+        );
+        assert!(!missing.directory.join("artifact.json").exists());
     }
 
     /// The evidence of a refused resolution: the discovery's streams and the error are kept,
