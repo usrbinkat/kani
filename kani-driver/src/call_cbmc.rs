@@ -601,10 +601,14 @@ pub(crate) async fn supervise(
     })
 }
 
-/// The verification result of a supervised execution: CBMC's results when it ran to its end;
-/// no verdict when it was killed at its `deadline` (`--loop-bounds`) or `--harness-timeout`. A
-/// deadline whose cleanup failed, and an execution error, are errors: no result is accepted from
-/// them.
+/// The verification result of a supervised execution. Only a normal exit permits its properties
+/// to be interpreted, whatever its exit code (CBMC exits nonzero for a harness Kani verifies, its
+/// reachability checks reported as failures). A run terminated by a signal has no verdict
+/// whatever it printed: its properties may be incomplete or the signal may have interrupted a
+/// consistent run, and neither can qualify a proof or detect a planted defect; they stay in the
+/// run's log as diagnostics. A run killed at its `deadline` (`--loop-bounds`) or
+/// `--harness-timeout` has no verdict. A deadline whose cleanup failed, and an execution error,
+/// are errors: no result is accepted from them.
 pub(crate) fn verification_of(
     supervised: Supervised,
     deadline: Option<u64>,
@@ -612,17 +616,19 @@ pub(crate) fn verification_of(
     collect_cbmc_stats: bool,
 ) -> Result<VerificationResult> {
     let results = match supervised.termination {
-        SolverTermination::Exited { .. } | SolverTermination::Signaled { .. } => {
+        SolverTermination::Exited { code } => {
             let output = supervised
                 .output
-                .ok_or_else(|| anyhow::anyhow!("a CBMC run that ended has no output"))?;
+                .ok_or_else(|| anyhow::anyhow!("a CBMC run that exited has no output"))?;
             return Ok(VerificationResult::from(
-                output,
+                output.processed_items,
+                code,
                 should_panic,
                 supervised.elapsed,
                 collect_cbmc_stats,
             ));
         }
+        SolverTermination::Signaled { signal } => Err(ExitStatus::Signaled(signal)),
         SolverTermination::Deadline { cleanup_error: Some(error), .. } => {
             bail!("CBMC could not be terminated at its deadline: {error}")
         }
@@ -679,22 +685,25 @@ quantifier are NOT enforced (a successful result would not cover the intended pr
 }
 
 impl VerificationResult {
-    /// Computes a `VerificationResult` (kani-driver's notion of the result of a CBMC call) from a
-    /// `VerificationOutput` (cbmc_output_parser's idea of CBMC results).
+    /// Computes a `VerificationResult` (kani-driver's notion of the result of a CBMC call) from
+    /// the items of a CBMC run that exited by itself with `exit_code` (cbmc_output_parser's idea
+    /// of CBMC results). Only a normal exit reaches here: a run terminated by a signal gives no
+    /// verdict whatever it printed ([`verification_of`]).
     ///
-    /// NOTE: We actually ignore the CBMC exit status, in favor of two checks:
+    /// NOTE: We actually ignore the CBMC exit code, in favor of two checks:
     ///   1. Examining the actual results of CBMC properties.
     ///      (CBMC will regularly report "failure" but that's just our cover checks.)
     ///   2. Positively checking for the presence of results.
     ///      (Do not mistake lack of results for success: report it as failure.)
     fn from(
-        output: VerificationOutput,
+        processed_items: Vec<ParserItem>,
+        exit_code: i32,
         should_panic: bool,
         runtime: Duration,
         collect_cbmc_stats: bool,
     ) -> VerificationResult {
-        let ignored_quantifiers = count_ignored_quantifiers(&output.processed_items);
-        let (remaining_items, results) = extract_results(output.processed_items);
+        let ignored_quantifiers = count_ignored_quantifiers(&processed_items);
+        let (remaining_items, results) = extract_results(processed_items);
 
         // Only `--export-json` consumes these, and collecting them means running several regexes
         // over every message CBMC emitted, so skip the work entirely when nothing will read it.
@@ -724,14 +733,10 @@ impl VerificationResult {
             }
         } else {
             // We never got results from CBMC - something went wrong (e.g. crash) so it's failure
-            let exit_status = match output.termination {
-                ProcessTermination::Exited { code } => ExitStatus::Exited(code),
-                ProcessTermination::Signaled { signal } => ExitStatus::Signaled(signal),
-            };
             VerificationResult {
                 status: VerificationStatus::Failure,
                 failed_properties: FailedProperties::Other,
-                results: Err(exit_status),
+                results: Err(ExitStatus::Exited(exit_code)),
                 runtime,
                 generated_concrete_test: false,
                 ignored_quantifiers,
@@ -1097,6 +1102,62 @@ mod tests {
         assert_eq!(result.status, VerificationStatus::Failure);
         let timed_out = verification_of(supervised("sleep 30", Some(limit)), None, false, false);
         assert!(matches!(timed_out.unwrap().results, Err(ExitStatus::Timeout)));
+    }
+
+    /// CBMC's result item of one assertion with `status`, as `--json-ui` reports it.
+    fn properties(status: &str) -> Vec<ParserItem> {
+        let item = serde_json::from_str(&format!(
+            r#"{{"result": [{{"description": "assertion failed: x", "property": "h.assertion.1",
+                "sourceLocation": {{"file": "a.rs", "function": "h", "line": "1", "column": "1"}},
+                "status": "{status}"}}]}}"#
+        ))
+        .unwrap();
+        vec![item]
+    }
+
+    /// A supervised run that ended by `termination`, CBMC having printed `items`.
+    fn ended(termination: ProcessTermination, items: Vec<ParserItem>) -> Supervised {
+        Supervised {
+            termination: match termination {
+                ProcessTermination::Exited { code } => SolverTermination::Exited { code },
+                ProcessTermination::Signaled { signal } => SolverTermination::Signaled { signal },
+            },
+            output: Some(VerificationOutput { termination, processed_items: items }),
+            elapsed: Duration::from_millis(7),
+        }
+    }
+
+    /// Only a normal exit permits property interpretation, whatever its code: exit 10 with
+    /// successful properties verifies. A signal gives no verdict whatever CBMC printed before
+    /// it, successful properties, a failed assertion or none: never a proof and never an
+    /// attributable failure.
+    #[test]
+    fn only_a_normal_exit_interprets_properties() {
+        let verified = verification_of(
+            ended(ProcessTermination::Exited { code: 10 }, properties("SUCCESS")),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(verified.status, VerificationStatus::Success);
+        assert!(verified.results.is_ok());
+        for items in [properties("SUCCESS"), properties("FAILURE"), Vec::new()] {
+            let found = verification_of(
+                ended(ProcessTermination::Signaled { signal: 9 }, items),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+            assert!(matches!(found.results, Err(ExitStatus::Signaled(9))));
+            assert_eq!(found.status, VerificationStatus::Failure);
+            assert!(matches!(found.failed_properties, FailedProperties::None));
+            assert_eq!(found.runtime, Duration::from_millis(7));
+            let rendered = found.render(&OutputFormat::Regular, false);
+            assert!(rendered.contains("CBMC failed: terminated by signal 9"), "{rendered}");
+            assert!(!rendered.contains("SUCCESSFUL") && !rendered.contains("Failed Checks"));
+        }
     }
 
     /// A deadline whose cleanup failed, and an execution error, are never accepted as a
