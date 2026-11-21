@@ -175,20 +175,26 @@ impl KaniSession {
             }
 
             let output = result.render(&self.args.output_format(), harness.attributes.should_panic);
+            self.emit_harness_line(&output);
+        }
+    }
 
-            if rayon::current_num_threads() > 1 {
-                self.emit_line(&format!("Thread {thread_index}: {output}"));
-            } else {
-                self.emit_line(&output);
-            }
+    /// Emit one line of a harness's report ([`Self::emit_line`]), prefixed with the harness's
+    /// thread when harnesses are checked in parallel: the one prefixing of a harness's lines.
+    pub(crate) fn emit_harness_line(&self, line: &str) {
+        if rayon::current_num_threads() > 1 {
+            let thread_index = rayon::current_thread_index().unwrap_or_default();
+            self.emit_line(&format!("Thread {thread_index}: {line}"));
+        } else {
+            self.emit_line(line);
         }
     }
 
     /// Emit one line of harness output: to `--log-file` when one is configured, so the
     /// terminal is left to the progress indicator, and to stdout otherwise.
     ///
-    /// `line` is emitted as given. Callers own any `Thread N:` prefix, so that the
-    /// log file and stdout carry identical text.
+    /// `line` is emitted as given; [`Self::emit_harness_line`] adds a harness's `Thread N:`
+    /// prefix, so that the log file and stdout carry identical text.
     fn emit_line(&self, line: &str) {
         if let Some(ref log_file_path) = self.args.log_file {
             if let Err(e) = crate::log_file::append_line(log_file_path, line) {
@@ -245,7 +251,7 @@ impl KaniSession {
         let thread_index = rayon::current_thread_index().unwrap_or_default();
         if !self.args.common_args.quiet {
             // If the harness is automatically generated, pretty_name refers to the function under verification.
-            let mut msg = if harness.is_automatically_generated {
+            let msg = if harness.is_automatically_generated {
                 // A bounded harness only explores some arguments up to a bound, so it does not
                 // check *all* possible inputs; qualify the message accordingly so a bounded run
                 // does not masquerade as exhaustive (c.f. the "(bounded)" marker in the summary).
@@ -269,27 +275,18 @@ impl KaniSession {
                 format!("Checking harness {}...", harness.pretty_name)
             };
 
-            if rayon::current_num_threads() > 1 {
-                msg = format!("Thread {thread_index}: {msg}");
-            }
-
-            self.emit_line(&msg);
+            self.emit_harness_line(&msg);
 
             // Print stubs applied to this harness so users know which
             // assumptions are in effect.
-            let multi = rayon::current_num_threads() > 1;
-            let print_line = |line: String| {
-                if multi {
-                    self.emit_line(&format!("Thread {thread_index}: {line}"));
-                } else {
-                    self.emit_line(&line);
-                }
-            };
             for stub in &harness.attributes.stubs {
-                print_line(format!("  - Stub: {} -> {}", stub.original, stub.replacement));
+                self.emit_harness_line(&format!(
+                    "  - Stub: {} -> {}",
+                    stub.original, stub.replacement
+                ));
             }
             for verified in &harness.attributes.verified_stubs {
-                print_line(format!("  - Verified stub: {verified}"));
+                self.emit_harness_line(&format!("  - Verified stub: {verified}"));
             }
         }
 
