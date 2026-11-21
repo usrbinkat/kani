@@ -47,6 +47,10 @@ pub struct KaniSession {
     /// The temporary files we littered that need to be cleaned up at the end of execution
     pub temporaries: Mutex<Vec<PathBuf>>,
 
+    /// The harness-scoped loop bounds of `--loop-bounds`, read and validated once, with the
+    /// evidence directory of `--loop-bounds-evidence`.
+    pub loop_bounds: Option<crate::loop_bounds::LoopBounds>,
+
     /// The tokio runtime
     pub runtime: tokio::runtime::Runtime,
 }
@@ -65,6 +69,13 @@ impl KaniSession {
     pub fn new(args: VerificationArgs) -> Result<Self> {
         init_logger(&args);
         let install = InstallType::new()?;
+        // Clap requires each of the two options with the other (`VerificationArgs`).
+        let loop_bounds = args
+            .loop_bounds
+            .as_deref()
+            .zip(args.loop_bounds_evidence.as_deref())
+            .map(|(policy, evidence)| crate::loop_bounds::LoopBounds::load(policy, evidence))
+            .transpose()?;
 
         Ok(KaniSession {
             args,
@@ -72,6 +83,7 @@ impl KaniSession {
             kani_compiler: install.kani_compiler()?,
             kani_lib_c: install.kani_lib_c()?,
             temporaries: Mutex::new(vec![]),
+            loop_bounds,
             runtime: tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap(),
         })
     }

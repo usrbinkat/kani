@@ -7,7 +7,7 @@ use regex::Regex;
 use rustc_demangle::demangle;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -215,12 +215,38 @@ pub struct VerificationResult {
 impl KaniSession {
     /// Verify a goto binary that's been prepared with goto-instrument
     pub fn run_cbmc(&self, file: &Path, harness: &HarnessMetadata) -> Result<VerificationResult> {
-        let args: Vec<OsString> = self.cbmc_flags(file, harness)?;
+        let mut args: Vec<OsString> = self.cbmc_flags(file, harness)?;
 
-        // TODO get cbmc path from self
-        let mut cmd = TokioCommand::new("cbmc");
+        // The harness's loop bounds, resolved against `file` as instrumentation left it, each step
+        // recorded in the harness's own evidence before the next reads it, and applied to this
+        // run's arguments alone (harnesses may be checked in parallel).
+        let evidence = match &self.loop_bounds {
+            Some(bounds) => {
+                let evidence = bounds.reserve(harness)?;
+                if let Some((lines, unwindset)) = bounds.apply(harness, file, &evidence)? {
+                    for line in lines {
+                        self.emit_harness_line(&line);
+                    }
+                    args.extend(unwindset);
+                }
+                Some(evidence)
+            }
+            None => None,
+        };
+
+        // The solver, resolved once on the PATH the command would search, the bundle's own
+        // first, and canonicalized: the command spawns this executable, so its record names
+        // what ran.
+        let found = which::which("cbmc")
+            .map_err(|error| anyhow::anyhow!("Failed to find cbmc: {error}"))?;
+        let solver = found
+            .canonicalize()
+            .map_err(|error| anyhow::anyhow!("Failed to resolve {}: {error}", found.display()))?;
+        let mut cmd = TokioCommand::new(&solver);
         cmd.args(args);
 
+        // `--loop-bounds` refuses `old` in argument validation, so a run with evidence always takes
+        // the piped executor, which records the launch at its spawn.
         let verification_results = if self.args.output_format() == crate::args::OutputFormat::Old {
             if self.run_terminal_timeout(cmd).is_err() {
                 VerificationResult::mock_failure()
@@ -233,7 +259,7 @@ impl KaniSession {
             // TODO: move this now that we don't use --visualize
             cmd.arg("--json-ui");
 
-            self.runtime.block_on(self.run_cbmc_piped(cmd, harness))?
+            self.runtime.block_on(self.run_cbmc_piped(cmd, harness, file, evidence.as_ref()))?
         };
 
         Ok(verification_results)
@@ -243,15 +269,29 @@ impl KaniSession {
         &self,
         mut cmd: TokioCommand,
         harness: &HarnessMetadata,
+        file: &Path,
+        evidence: Option<&crate::loop_bounds::HarnessEvidence>,
     ) -> Result<VerificationResult> {
         if self.args.common_args.verbose() {
             println!("[Kani] Running: `{}`", render_command(cmd.as_std()).to_string_lossy());
         }
+        cmd.stdout(std::process::Stdio::piped());
+        // The command is complete: the launch attempt is recorded from it, immediately before it
+        // is spawned, and a record that cannot be written stops the run before the spawn.
+        if let Some(evidence) = evidence {
+            let command = cmd.as_std();
+            let arguments: Vec<OsString> = command.get_args().map(OsStr::to_os_string).collect();
+            evidence.launch(command.get_program(), &arguments)?;
+            self.emit_harness_line(&format!(
+                "{}{} {}",
+                crate::loop_bounds::LAUNCH_LINE,
+                harness.pretty_name,
+                file.display()
+            ));
+        }
         // Spawn the CBMC process and process its output below
-        let mut cbmc_process = cmd
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|_| anyhow::Error::msg("Failed to run cbmc"))?;
+        let mut cbmc_process =
+            cmd.spawn().map_err(|error| anyhow::anyhow!("Failed to run cbmc: {error}"))?;
 
         let start_time = Instant::now();
 

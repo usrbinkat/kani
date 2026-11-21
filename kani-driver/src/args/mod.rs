@@ -350,6 +350,19 @@ pub struct VerificationArgs {
     #[arg(long, hide_short_help = true)]
     pub output_into_files: bool,
 
+    /// Apply the harness-scoped loop bounds of this JSON file, each resolved against the
+    /// instrumented goto binary of its harness before verification (see `loop_bounds.rs`).
+    /// This feature is unstable and it requires `-Z unstable-options` to be used
+    #[arg(long, value_name = "PATH", requires("loop_bounds_evidence"))]
+    pub loop_bounds: Option<PathBuf>,
+
+    /// The existing directory the evidence of `--loop-bounds` is written into: per harness, the
+    /// loop discovery's invocation, termination and streams, the resolution, CBMC's command, the
+    /// driver and solver executables, and the launch attempt, each created exclusively. Required
+    /// with `--loop-bounds`.
+    #[arg(long, value_name = "DIR", requires("loop_bounds"))]
+    pub loop_bounds_evidence: Option<PathBuf>,
+
     /// Write verbose and terse log output to the specified file.
     /// When enabled with an interactive terminal, progress indicator will be shown on terminal
     /// while detailed logs are written to the file.
@@ -814,6 +827,12 @@ impl ValidateArgs for VerificationArgs {
                 UnstableFeature::UnstableOptions,
             )?;
 
+            self.common_args.check_unstable(
+                self.loop_bounds.is_some(),
+                "loop-bounds",
+                UnstableFeature::UnstableOptions,
+            )?;
+
             Ok(())
         };
 
@@ -830,6 +849,32 @@ impl ValidateArgs for VerificationArgs {
                     ErrorKind::ArgumentConflict,
                     "Conflicting flags: unwind flags provided to kani and in --cbmc-args.",
                 ));
+            }
+            if self.loop_bounds.is_some() {
+                // One source of loop-specific bounds per run: CBMC merges repeated
+                // `--unwindset` options, so a bound passed through `--cbmc-args` would silently
+                // combine with, or override, a resolved one.
+                if self.cbmc_args.iter().any(|s| s.to_str().unwrap().starts_with("--unwindset")) {
+                    return Err(Error::raw(
+                        ErrorKind::ArgumentConflict,
+                        "Conflicting options: --loop-bounds and --unwindset in --cbmc-args.",
+                    ));
+                }
+                // A bound without its unwinding assertion would cut executions off silently.
+                if !self.checks.unwinding_on() {
+                    return Err(Error::raw(
+                        ErrorKind::ArgumentConflict,
+                        "Conflicting options: --loop-bounds requires unwinding checks.",
+                    ));
+                }
+                // `old` runs CBMC without the per-harness report that records the resolution.
+                if self.output_format() == OutputFormat::Old {
+                    return Err(Error::raw(
+                        ErrorKind::ArgumentConflict,
+                        "Conflicting options: --loop-bounds isn't compatible with \
+                         --output-format=old.",
+                    ));
+                }
             }
             if self.cbmc_args.contains(&OsString::from("--function")) {
                 return Err(Error::raw(
@@ -1260,6 +1305,43 @@ mod tests {
             "kani file.rs -Z unstable-options --export-json out.json --no-codegen",
             ErrorKind::ArgumentConflict,
         );
+    }
+
+    #[test]
+    fn check_loop_bounds_unstable() {
+        check_opt!(
+            "--loop-bounds bounds.json --loop-bounds-evidence evidence",
+            Some(UnstableFeature::UnstableOptions),
+            loop_bounds,
+            Some(PathBuf::from("bounds.json"))
+        );
+    }
+
+    #[test]
+    fn check_loop_bounds_require_their_evidence() {
+        for args in [
+            "kani file.rs -Z unstable-options --loop-bounds b.json",
+            "kani file.rs -Z unstable-options --loop-bounds-evidence e",
+        ] {
+            let error = StandaloneArgs::try_parse_from(args.split_whitespace()).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument, "{args}");
+        }
+    }
+
+    #[test]
+    fn check_loop_bounds_conflicts() {
+        for args in [
+            "kani file.rs -Z unstable-options --loop-bounds b.json --loop-bounds-evidence e \
+             --cbmc-args --unwindset f.0:1",
+            "kani file.rs -Z unstable-options --loop-bounds b.json --loop-bounds-evidence e \
+             --no-unwinding-checks",
+            "kani file.rs -Z unstable-options --loop-bounds b.json --loop-bounds-evidence e \
+             --no-default-checks",
+            "kani file.rs -Z unstable-options --loop-bounds b.json --loop-bounds-evidence e \
+             --output-format=old",
+        ] {
+            expect_validation_error(args, ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]

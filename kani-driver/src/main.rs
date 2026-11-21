@@ -40,6 +40,7 @@ mod coverage;
 mod harness_runner;
 mod list;
 mod log_file;
+mod loop_bounds;
 mod metadata;
 mod progress_indicator;
 mod project;
@@ -174,6 +175,9 @@ fn verify_project(project: Project, session: KaniSession) -> Result<()> {
     // overhead for every other run, including a `cbmc --version` probe in `process_cbmc_results`.
     let mut handler =
         session.args.export_json.as_ref().map(|path| JsonHandler::new(Some(path.clone())));
+    if let Some(bounds) = &session.loop_bounds {
+        bounds.policy.check_harnesses(&project.get_all_harnesses())?;
+    }
     let harnesses = session.determine_targets(project.get_all_harnesses())?;
     debug!(n = harnesses.len(), ?harnesses, "verify_project");
 
