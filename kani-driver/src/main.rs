@@ -203,6 +203,9 @@ fn verify_project(project: Project, session: KaniSession) -> Result<()> {
     // Verification
     let runner = harness_runner::HarnessRunner { sess: &session, project: &project };
     let results = runner.check_all_harnesses(&harnesses, handler.as_mut())?;
+    if let Some(bounds) = &session.loop_bounds {
+        bounds.record_function_scope()?;
+    }
 
     if let Some(handler) = handler.as_mut() {
         // Process harness results and add additional metadata using frontend utility function

@@ -1,13 +1,16 @@
 // Copyright Kani Contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Harness-scoped loop bounds (`--loop-bounds FILE --loop-bounds-evidence DIR`,
+//! Function- and harness-scoped loop bounds (`--loop-bounds FILE --loop-bounds-evidence DIR`,
 //! `-Z unstable-options`).
 //!
-//! A policy file names, per harness, loops by what the source fixes: the function holding the loop
-//! (its pretty name, generic arguments included), the source file of that function, the number of
-//! loops the function is expected to have, the loop's number within it, the bound, and the reason
-//! the bound covers the harness's domain. The concrete CBMC loop identifiers are never part of the
+//! A policy file names loops by what the source fixes: the function holding the loop (its pretty
+//! name, generic arguments included), the source file of that function, the number of loops the
+//! function is expected to have, the loop's number within it, the bound, and the reason the bound
+//! holds. Each loop's bound is declared once, at the scope its reason belongs to: a bound that is a
+//! property of the code (a loop over a fixed table) is function-scoped, applied in every harness
+//! whose binary holds the function; a bound that rests on one harness's domain is that harness's.
+//! No loop is bounded in both scopes. The concrete CBMC loop identifiers are never part of the
 //! policy: they are derived from the goto binary CBMC is about to check, after Kani's
 //! instrumentation has rewritten it in place (harness specialization, contract instrumentation,
 //! unused-function removal and back-edge rewriting can each change the loops a function holds).
@@ -38,10 +41,11 @@
 //! copy is the one binary the harness's run reads from then on: the build directory may be
 //! rewritten by a later run or another instrumentation of the same path without changing what was
 //! checked, and the copy survives a refused resolution or a failed verification for replay. For
-//! a harness the policy bounds, the discovery's invocation,
-//! termination, stdout and stderr are written before they are parsed; then the resolution (the
-//! harness, its policy entry, the binary's SHA-256 digest and each resolved loop with its source
-//! location), or the error that refused it. For every harness, the final CBMC command (NUL-ended
+//! every harness, the loop discovery's invocation, termination, stdout and stderr are written
+//! before they are parsed, and the inventory is validated; for a harness the policy bounds, then
+//! the resolution (the harness, its policy entry, the binary's SHA-256 digest and each resolved
+//! loop with its source location). An inventory or resolution that is refused leaves its error
+//! (`resolution.error`). For every harness, the final CBMC command (NUL-ended
 //! parts), the driver and solver executables (canonical path and SHA-256 digest), and the launch
 //! attempt are recorded, in files and in the harness's report, immediately before CBMC is spawned:
 //! a refused policy leaves its discovery and its error and no attempt.
@@ -65,10 +69,13 @@ pub const BOUND_LINE: &str = "Loop bound: ";
 /// The prefix of the line recording that CBMC is about to be spawned for a harness.
 pub const LAUNCH_LINE: &str = "CBMC launch attempt: ";
 
-/// A `--loop-bounds` file: the harnesses that take loop bounds of their own.
+/// A `--loop-bounds` file: the loops whose bound is a property of the code that holds them, each
+/// applied in every harness whose binary holds its function, and the harnesses that take loop
+/// bounds of their own.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
+    pub loops: Vec<Selector>,
     pub harnesses: Vec<HarnessPolicy>,
 }
 
@@ -109,61 +116,37 @@ impl Policy {
     }
 
     /// Parse and validate a policy: harnesses named once each, every harness with at least one
-    /// bound, every bound with a reason, no loop selected twice, every selected loop number below
-    /// its function's declared loop count, and one loop count and one file per function.
+    /// bound; in each scope, every bound with a reason, no loop selected twice, every selected
+    /// loop number below its function's declared loop count, and one loop count and one file per
+    /// function; and no loop bounded both by the function scope and by a harness.
     pub fn parse(text: &str) -> Result<Self> {
         let policy: Policy = serde_json::from_str(text)?;
+        check_selectors("the function scope", &policy.loops)?;
+        let scoped: BTreeSet<(&str, u32)> = policy
+            .loops
+            .iter()
+            .map(|selector| (selector.function.as_str(), selector.number))
+            .collect();
         let mut harnesses = BTreeSet::new();
         for entry in &policy.harnesses {
+            let scope = format!("harness `{}`", entry.harness);
             if !harnesses.insert(entry.harness.as_str()) {
-                bail!("harness `{}` is named more than once", entry.harness);
+                bail!("{scope} is named more than once");
             }
             if entry.loops.is_empty() {
-                bail!("harness `{}` declares no loop bound", entry.harness);
+                bail!("{scope} declares no loop bound");
             }
-            let mut selected = BTreeSet::new();
-            let mut functions: BTreeMap<&str, (&str, u32)> = BTreeMap::new();
-            for selector in &entry.loops {
-                if selector.reason.trim().is_empty() {
-                    bail!(
-                        "harness `{}`: the bound of loop {} of `{}` gives no reason",
-                        entry.harness,
-                        selector.number,
-                        selector.function
-                    );
-                }
-                if selector.number >= selector.loops_in_function {
-                    bail!(
-                        "harness `{}`: loop {} of `{}` is not one of its {} loop(s)",
-                        entry.harness,
-                        selector.number,
-                        selector.function,
-                        selector.loops_in_function
-                    );
-                }
-                if !selected.insert((selector.function.as_str(), selector.number)) {
-                    bail!(
-                        "harness `{}`: loop {} of `{}` is bounded more than once",
-                        entry.harness,
-                        selector.number,
-                        selector.function
-                    );
-                }
-                let shape = (selector.file.as_str(), selector.loops_in_function);
-                if let Some(previous) = functions.insert(selector.function.as_str(), shape)
-                    && previous != shape
-                {
-                    bail!(
-                        "harness `{}`: `{}` is declared both as {} loop(s) in {} and as {} loop(s) \
-                         in {}",
-                        entry.harness,
-                        selector.function,
-                        previous.1,
-                        previous.0,
-                        shape.1,
-                        shape.0
-                    );
-                }
+            check_selectors(&scope, &entry.loops)?;
+            if let Some(both) = entry
+                .loops
+                .iter()
+                .find(|selector| scoped.contains(&(selector.function.as_str(), selector.number)))
+            {
+                bail!(
+                    "{scope}: loop {} of `{}` is bounded by the function scope too",
+                    both.number,
+                    both.function
+                );
             }
         }
         Ok(policy)
@@ -193,11 +176,60 @@ impl Policy {
     }
 }
 
-/// A run's loop bounds: the validated policy and the evidence directory the caller owns.
+/// The selectors of one `scope`, validated: every bound with a reason, every selected loop number
+/// below its function's declared loop count, no loop selected twice, and one loop count and one
+/// file per function.
+fn check_selectors(scope: &str, selectors: &[Selector]) -> Result<()> {
+    let mut selected = BTreeSet::new();
+    let mut functions: BTreeMap<&str, (&str, u32)> = BTreeMap::new();
+    for selector in selectors {
+        if selector.reason.trim().is_empty() {
+            bail!(
+                "{scope}: the bound of loop {} of `{}` gives no reason",
+                selector.number,
+                selector.function
+            );
+        }
+        if selector.number >= selector.loops_in_function {
+            bail!(
+                "{scope}: loop {} of `{}` is not one of its {} loop(s)",
+                selector.number,
+                selector.function,
+                selector.loops_in_function
+            );
+        }
+        if !selected.insert((selector.function.as_str(), selector.number)) {
+            bail!(
+                "{scope}: loop {} of `{}` is bounded more than once",
+                selector.number,
+                selector.function
+            );
+        }
+        let shape = (selector.file.as_str(), selector.loops_in_function);
+        if let Some(previous) = functions.insert(selector.function.as_str(), shape)
+            && previous != shape
+        {
+            bail!(
+                "{scope}: `{}` is declared both as {} loop(s) in {} and as {} loop(s) in {}",
+                selector.function,
+                previous.1,
+                previous.0,
+                shape.1,
+                shape.0
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A run's loop bounds: the validated policy, the evidence directory the caller owns, and, per
+/// function-scoped selector (by index in [`Policy::loops`]), the harnesses of the run that
+/// resolved it.
 #[derive(Debug)]
 pub struct LoopBounds {
     pub policy: Policy,
     evidence: PathBuf,
+    applied: std::sync::Mutex<BTreeMap<usize, BTreeSet<String>>>,
 }
 
 impl LoopBounds {
@@ -207,7 +239,29 @@ impl LoopBounds {
         if !evidence.is_dir() {
             bail!("the loop-bounds evidence directory {} does not exist", evidence.display());
         }
-        Ok(Self { policy, evidence: evidence.to_path_buf() })
+        Ok(Self { policy, evidence: evidence.to_path_buf(), applied: Default::default() })
+    }
+
+    /// Record, once every harness of the run has been checked, each function-scoped selector
+    /// with the harnesses whose binary it bounded (`function-scope.json` in the evidence
+    /// directory, created exclusively). A selector no harness of a run resolved is recorded with
+    /// none: whether that is a loss is for the caller that knows which harnesses the run covers.
+    pub fn record_function_scope(&self) -> Result<()> {
+        let applied = self.applied.lock().expect("the applied record is never poisoned");
+        let record: Vec<serde_json::Value> = self
+            .policy
+            .loops
+            .iter()
+            .enumerate()
+            .map(|(index, selector)| {
+                serde_json::json!({
+                    "selector": selector,
+                    "harnesses": applied.get(&index).cloned().unwrap_or_default(),
+                })
+            })
+            .collect();
+        HarnessEvidence { directory: self.evidence.clone() }
+            .write("function-scope.json", serde_json::to_string_pretty(&record)?.as_bytes())
     }
 
     /// The evidence of `harness`: its subdirectory, created exclusively.
@@ -219,31 +273,57 @@ impl LoopBounds {
         Ok(HarnessEvidence { directory })
     }
 
-    /// The bounds the policy declares for `harness`, resolved against `artifact`, the harness's
-    /// preserved binary ([`HarnessEvidence::preserve_artifact`]), every step's evidence written
-    /// into `evidence` before the next step reads it: the lines reporting the resolution, then
-    /// the CBMC arguments applying it. `None` when the harness has no bounds.
+    /// The loop inventory of `artifact`, the harness's preserved binary
+    /// ([`HarnessEvidence::preserve_artifact`]), discovered and validated for every harness, and
+    /// the bounds that apply to `harness` resolved against it: its own entry's, and every
+    /// function-scoped selector whose function the inventory holds; every step's evidence
+    /// written into `evidence` before the next step reads it: the lines reporting the
+    /// resolution, then the CBMC arguments applying it. `None` when no bound applies, the
+    /// inventory recorded all the same.
     pub fn apply(
         &self,
         harness: &HarnessMetadata,
         artifact: &Artifact,
         evidence: &HarnessEvidence,
     ) -> Result<Option<(Vec<String>, Vec<OsString>)>> {
-        let Some(entry) = self.policy.for_harness(&harness.pretty_name) else {
-            return Ok(None);
-        };
         let text = evidence.discover(&artifact.path)?;
+        let entry = self.policy.for_harness(&harness.pretty_name);
         let resolution = parse_inventory(&text).and_then(|(loops, warnings)| {
-            let resolved = resolve(entry, &loops)?;
-            Ok((warnings, resolved))
+            let scoped: Vec<usize> = self
+                .policy
+                .loops
+                .iter()
+                .enumerate()
+                .filter(|(_, selector)| {
+                    loops.iter().any(|listed| {
+                        listed.location.function.as_deref() == Some(selector.function.as_str())
+                    })
+                })
+                .map(|(index, _)| index)
+                .collect();
+            let selectors: Vec<&Selector> = entry
+                .into_iter()
+                .flat_map(|entry| &entry.loops)
+                .chain(scoped.iter().map(|&index| &self.policy.loops[index]))
+                .collect();
+            let resolved = resolve(&harness.pretty_name, &selectors, &loops)?;
+            Ok((warnings, scoped, resolved))
         });
-        let (warnings, resolved) = match resolution {
+        let (warnings, scoped, resolved) = match resolution {
             Ok(resolution) => resolution,
             Err(error) => {
                 evidence.write("resolution.error", format!("{error:#}\n").as_bytes())?;
                 return Err(error);
             }
         };
+        if resolved.is_empty() {
+            return Ok(None);
+        }
+        let mut applied = self.applied.lock().expect("the applied record is never poisoned");
+        for &index in &scoped {
+            applied.entry(index).or_default().insert(harness.pretty_name.clone());
+        }
+        drop(applied);
         let mut lines = Vec::with_capacity(resolved.len() + warnings.len() + 1);
         lines.extend(warnings.iter().map(|warning| format!("Loop inventory warning: {warning}")));
         lines.push(format!(
@@ -255,6 +335,7 @@ impl LoopBounds {
         let record = serde_json::json!({
             "harness": harness.pretty_name,
             "policy": entry,
+            "function_scope": scoped.iter().map(|&index| &self.policy.loops[index]).collect::<Vec<_>>(),
             "artifact": { "path": artifact.path, "sha256": artifact.sha256 },
             "warnings": warnings,
             "resolved": resolved.iter().map(|entry| serde_json::json!({
@@ -513,15 +594,15 @@ impl Resolved {
     }
 }
 
-/// Resolve each of `policy`'s selectors against `loops`, the inventory of the binary CBMC is about
-/// to check: the function's loops must number exactly as declared, all lie in the declared file,
-/// and come from one function symbol; the selected number must be one of them; and no two
-/// selectors may resolve to one loop. These checks do not establish which source loop a number
-/// denotes (see the module documentation).
-pub fn resolve(policy: &HarnessPolicy, loops: &[Loop]) -> Result<Vec<Resolved>> {
-    let mut resolved = Vec::with_capacity(policy.loops.len());
+/// Resolve each of `selectors`, the bounds that apply to `harness`, against `loops`, the inventory
+/// of the binary CBMC is about to check: the function's loops must number exactly as declared,
+/// all lie in the declared file, and come from one function symbol; the selected number must be
+/// one of them; and no two selectors may resolve to one loop. These checks do not establish which
+/// source loop a number denotes (see the module documentation).
+pub fn resolve(harness: &str, selectors: &[&Selector], loops: &[Loop]) -> Result<Vec<Resolved>> {
+    let mut resolved = Vec::with_capacity(selectors.len());
     let mut used = BTreeSet::new();
-    for selector in &policy.loops {
+    for &selector in selectors {
         let candidates: Vec<&Loop> = loops
             .iter()
             .filter(|listed| {
@@ -545,7 +626,7 @@ pub fn resolve(policy: &HarnessPolicy, loops: &[Loop]) -> Result<Vec<Resolved>> 
             bail!(
                 "harness `{}`: `{}` has {} loop(s) in the instrumented binary, the policy declares \
                  {}:{}",
-                policy.harness,
+                harness,
                 selector.function,
                 candidates.len(),
                 selector.loops_in_function,
@@ -558,7 +639,7 @@ pub fn resolve(policy: &HarnessPolicy, loops: &[Loop]) -> Result<Vec<Resolved>> 
         {
             bail!(
                 "harness `{}`: loop `{}` of `{}` is in {}, the policy declares {}",
-                policy.harness,
+                harness,
                 elsewhere.name,
                 selector.function,
                 elsewhere.location.file.as_deref().unwrap_or("?"),
@@ -577,7 +658,7 @@ pub fn resolve(policy: &HarnessPolicy, loops: &[Loop]) -> Result<Vec<Resolved>> 
         if symbols.len() != 1 {
             bail!(
                 "harness `{}`: `{}` names {} function symbols in the instrumented binary:{}",
-                policy.harness,
+                harness,
                 selector.function,
                 symbols.len(),
                 describe(&candidates)
@@ -587,14 +668,14 @@ pub fn resolve(policy: &HarnessPolicy, loops: &[Loop]) -> Result<Vec<Resolved>> 
             [one] => (*one).clone(),
             _ => bail!(
                 "harness `{}`: `{}` has no loop {} in the instrumented binary:{}",
-                policy.harness,
+                harness,
                 selector.function,
                 selector.number,
                 describe(&candidates)
             ),
         };
         if !used.insert(listed.name.clone()) {
-            bail!("harness `{}`: two bounds resolve to loop `{}`", policy.harness, listed.name);
+            bail!("harness `{harness}`: two bounds resolve to loop `{}`", listed.name);
         }
         resolved.push(Resolved { selector: selector.clone(), listed });
     }
@@ -683,8 +764,9 @@ mod tests {
         }
     }
 
-    fn harness(loops: Vec<Selector>) -> HarnessPolicy {
-        HarnessPolicy { harness: "h".to_string(), loops }
+    /// `selectors` resolved for the harness `h` against `loops`.
+    fn resolved(selectors: &[Selector], loops: &[Loop]) -> Result<Vec<Resolved>> {
+        resolve("h", &selectors.iter().collect::<Vec<_>>(), loops)
     }
 
     #[test]
@@ -698,11 +780,8 @@ mod tests {
     #[test]
     fn a_selector_resolves_to_its_loop_and_bound() {
         let (loops, _) = parse_inventory(INVENTORY).unwrap();
-        let resolved = resolve(
-            &harness(vec![selector("pair", 2, 1, 4), selector("count_up", 1, 0, 0)]),
-            &loops,
-        )
-        .unwrap();
+        let resolved =
+            resolved(&[selector("pair", 2, 1, 4), selector("count_up", 1, 0, 0)], &loops).unwrap();
         assert_eq!(resolved[0].listed.name, "_RNvCs1_4demo4pair.1");
         assert_eq!(
             unwindset(&resolved),
@@ -720,17 +799,17 @@ mod tests {
     #[test]
     fn a_selector_without_its_loop_is_refused() {
         let (loops, _) = parse_inventory(INVENTORY).unwrap();
-        for (policy, expected) in [
-            (harness(vec![selector("absent", 1, 0, 1)]), "has 0 loop(s)"),
-            (harness(vec![selector("pair", 3, 2, 1)]), "has 2 loop(s)"),
-            (harness(vec![selector("count_up", 2, 1, 1)]), "has 1 loop(s)"),
+        for (selectors, expected) in [
+            ([selector("absent", 1, 0, 1)], "has 0 loop(s)"),
+            ([selector("pair", 3, 2, 1)], "has 2 loop(s)"),
+            ([selector("count_up", 2, 1, 1)], "has 1 loop(s)"),
         ] {
-            let error = resolve(&policy, &loops).unwrap_err().to_string();
+            let error = resolved(&selectors, &loops).unwrap_err().to_string();
             assert!(error.contains(expected), "{error}");
         }
         let mut elsewhere = selector("pair", 2, 0, 1);
         elsewhere.file = "other.rs".to_string();
-        let error = resolve(&harness(vec![elsewhere]), &loops).unwrap_err().to_string();
+        let error = resolved(&[elsewhere], &loops).unwrap_err().to_string();
         assert!(error.contains("is in demo.rs"), "{error}");
     }
 
@@ -738,7 +817,7 @@ mod tests {
     fn two_symbols_for_one_function_are_ambiguous() {
         let text = INVENTORY.replace("_RNvCs1_4demo4pair.1", "_RNvCs2_4demo4pair.1");
         let (loops, _) = parse_inventory(&text).unwrap();
-        let error = resolve(&harness(vec![selector("pair", 2, 0, 1)]), &loops).unwrap_err();
+        let error = resolved(&[selector("pair", 2, 0, 1)], &loops).unwrap_err();
         assert!(error.to_string().contains("names 2 function symbols"), "{error}");
     }
 
@@ -770,55 +849,74 @@ mod tests {
 
     #[test]
     fn a_policy_is_validated_before_use() {
-        let valid = r#"{"harnesses": [{"harness": "h", "loops": [
+        let valid = r#"{"loops": [
+            {"function": "count_up", "file": "demo.rs", "loops_in_function": 1, "loop": 0,
+             "bound": 0, "reason": "the code's"}
+        ], "harnesses": [{"harness": "h", "loops": [
             {"function": "pair", "file": "demo.rs", "loops_in_function": 2, "loop": 1, "bound": 4,
              "reason": "the test's"}
         ]}]}"#;
-        assert_eq!(Policy::parse(valid).unwrap().harnesses[0].loops[0], selector("pair", 2, 1, 4));
+        let policy = Policy::parse(valid).unwrap();
+        assert_eq!(policy.harnesses[0].loops[0], selector("pair", 2, 1, 4));
+        assert_eq!(policy.loops[0].function, "count_up");
         let entry = |loops: &str| format!(r#"{{"harness": "h", "loops": [{loops}]}}"#);
         let bound = |function: &str, file: &str, count: u32, number: u32| {
             format!(
                 r#"{{"function": "{function}", "file": "{file}", "loops_in_function": {count}, "loop": {number}, "bound": 1, "reason": "r"}}"#
             )
         };
+        let harnesses = |entries: &str| format!(r#"{{"loops": [], "harnesses": [{entries}]}}"#);
         for (text, expected) in [
             (
-                format!(
-                    r#"{{"harnesses": [{}, {}]}}"#,
+                harnesses(&format!(
+                    "{}, {}",
                     entry(&bound("f", "a.rs", 1, 0)),
                     entry(&bound("f", "a.rs", 1, 0))
-                ),
+                )),
                 "named more than once",
             ),
-            (format!(r#"{{"harnesses": [{}]}}"#, entry("")), "declares no loop bound"),
+            (harnesses(&entry("")), "declares no loop bound"),
+            (harnesses(&entry(&bound("f", "a.rs", 1, 1))), "is not one of its 1 loop(s)"),
             (
-                format!(r#"{{"harnesses": [{}]}}"#, entry(&bound("f", "a.rs", 1, 1))),
-                "is not one of its 1 loop(s)",
-            ),
-            (
-                format!(
-                    r#"{{"harnesses": [{}]}}"#,
-                    entry(&format!("{}, {}", bound("f", "a.rs", 2, 0), bound("f", "a.rs", 2, 0)))
-                ),
+                harnesses(&entry(&format!(
+                    "{}, {}",
+                    bound("f", "a.rs", 2, 0),
+                    bound("f", "a.rs", 2, 0)
+                ))),
                 "bounded more than once",
             ),
             (
-                format!(
-                    r#"{{"harnesses": [{}]}}"#,
-                    entry(&format!("{}, {}", bound("f", "a.rs", 2, 0), bound("f", "b.rs", 2, 1)))
-                ),
+                harnesses(&entry(&format!(
+                    "{}, {}",
+                    bound("f", "a.rs", 2, 0),
+                    bound("f", "b.rs", 2, 1)
+                ))),
                 "is declared both as",
             ),
             (
-                format!(
-                    r#"{{"harnesses": [{}]}}"#,
-                    entry(
-                        &bound("f", "a.rs", 1, 0).replace(r#""reason": "r""#, r#""reason": " ""#)
-                    )
-                ),
+                harnesses(&entry(
+                    &bound("f", "a.rs", 1, 0).replace(r#""reason": "r""#, r#""reason": " ""#),
+                )),
                 "gives no reason",
             ),
-            (r#"{"harnesses": [], "unknown": 1}"#.to_string(), "unknown field"),
+            (
+                format!(
+                    r#"{{"loops": [{}, {}], "harnesses": []}}"#,
+                    bound("f", "a.rs", 1, 0),
+                    bound("f", "a.rs", 1, 0)
+                ),
+                "the function scope: loop 0 of `f` is bounded more than once",
+            ),
+            (
+                format!(
+                    r#"{{"loops": [{}], "harnesses": [{}]}}"#,
+                    bound("f", "a.rs", 1, 0),
+                    entry(&bound("f", "a.rs", 1, 0))
+                ),
+                "is bounded by the function scope too",
+            ),
+            (r#"{"harnesses": []}"#.to_string(), "missing field `loops`"),
+            (r#"{"loops": [], "harnesses": [], "unknown": 1}"#.to_string(), "unknown field"),
         ] {
             let found = format!("{:#}", Policy::parse(&text).unwrap_err());
             assert!(found.contains(expected), "{expected}: {found}");
